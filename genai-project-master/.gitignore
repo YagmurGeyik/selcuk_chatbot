@@ -1,2 +1,4 @@
 Lib/
 share/
+.env
+.env.*
