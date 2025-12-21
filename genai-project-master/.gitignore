@@ -1,4 +1,13 @@
 Lib/
 share/
+
+# Secrets
 .env
 .env.*
+
+# Local data / docker volumes (never commit)
+volumes/
+**/volumes/
+
+# Local docs (optional)
+documents/
