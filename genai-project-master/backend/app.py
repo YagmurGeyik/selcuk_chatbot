@@ -2,6 +2,7 @@
 import os
 import time
 import re
+from pathlib import Path
 from typing import List, Dict, Any
 
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from openai import OpenAI
@@ -27,6 +29,10 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TOP_K = int(os.getenv("TOP_K", "3"))
 
+# PDF/DOC servis ayarları
+DOCS_DIR = Path(os.getenv("DOCS_DIR", "documents")).resolve()
+DOCS_URL_PREFIX = os.getenv("DOCS_URL_PREFIX", "/docs")  # URL path prefix
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY bulunamadı. .env dosyanı kontrol et.")
 
@@ -38,7 +44,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Selcuk Chatbot API")
 
 # Geliştirme için geniş CORS.
-# Yayında sadece selcuk.edu.tr domainini yazman daha güvenli olur.
+# Yayında allow_origins'i spesifik domain(ler) ile sınırla.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # PROD: ["https://www.selcuk.edu.tr"]
@@ -46,6 +52,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ✅ PDF/DOC static serve
+# documents/ klasörü varsa: http://localhost:8787/docs/<dosya.pdf>
+if DOCS_DIR.exists():
+    app.mount(DOCS_URL_PREFIX, StaticFiles(directory=str(DOCS_DIR)), name="docs")
 
 # -----------------------
 # MILVUS INIT
@@ -69,7 +80,7 @@ def init_milvus():
     if len(col.indexes) == 0:
         col.create_index(
             field_name=VECTOR_FIELD,
-            index_params={"metric_type": "IP", "index_type": "AUTOINDEX", "params": {}}
+            index_params={"metric_type": "IP", "index_type": "AUTOINDEX", "params": {}},
         )
         # index oluşana kadar bekle
         while True:
@@ -79,7 +90,9 @@ def init_milvus():
             time.sleep(1)
 
     col.load()
-    return col, ("source" in field_names), ("header" in field_names)
+    has_source = "source" in field_names
+    has_header = "header" in field_names
+    return col, has_source, has_header
 
 collection, HAS_SOURCE, HAS_HEADER = init_milvus()
 
@@ -90,8 +103,13 @@ class ChatRequest(BaseModel):
     message: str
     history: List[Dict[str, str]] = []  # [{"role":"user/assistant","content":"..."}]
 
+class SourceItem(BaseModel):
+    name: str
+    url: str
+
 class ChatResponse(BaseModel):
     answer: str
+    sources: List[SourceItem] = []
 
 # -----------------------
 # RAG HELPERS
@@ -119,14 +137,16 @@ def search_milvus(query_text: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
         output_fields=output_fields,
     )
 
-    hits = []
+    hits: List[Dict[str, Any]] = []
     for hit in results[0]:
-        hits.append({
-            "context": hit.entity.get("context"),
-            "source": hit.entity.get("source") if HAS_SOURCE else None,
-            "header": hit.entity.get("header") if HAS_HEADER else None,
-            "score": float(hit.distance),
-        })
+        hits.append(
+            {
+                "context": hit.entity.get("context"),
+                "source": hit.entity.get("source") if HAS_SOURCE else None,
+                "header": hit.entity.get("header") if HAS_HEADER else None,
+                "score": float(hit.distance),
+            }
+        )
     return hits
 
 def build_context_text(contexts: List[Dict[str, Any]]) -> str:
@@ -143,7 +163,7 @@ def build_context_text(contexts: List[Dict[str, Any]]) -> str:
 def ask_llm(question: str, contexts: List[Dict[str, Any]], history: List[Dict[str, str]]) -> str:
     context_text = build_context_text(contexts)
 
-    # Daha stabil cevaplar için temperature=0
+    # Kaynakları cevap içine yazdırmak yerine API'de ayrı alan olarak döndürüyoruz.
     prompt = f"""
 Aşağıdaki yönetmelik parçalarını kullanarak soruyu cevapla.
 
@@ -162,9 +182,7 @@ KURALLAR:
 YANIT:
 """.strip()
 
-    messages = [
-        {"role": "system", "content": "Sen Selçuk Üniversitesi öğrenci işlerinde uzman bir asistansın."}
-    ]
+    messages = [{"role": "system", "content": "Sen Selçuk Üniversitesi öğrenci işlerinde uzman bir asistansın."}]
 
     # Son birkaç mesajı ekleyelim (çok uzamasın)
     for m in history[-6:]:
@@ -184,6 +202,38 @@ YANIT:
     answer = re.sub(r"\[[^\]]+\.pdf\]", "", answer, flags=re.I).strip()
     return answer
 
+def extract_sources(contexts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Milvus hit'lerinden source alanlarını toplayıp tekrarsız şekilde
+    name+url olarak döndürür.
+    """
+    sources: List[Dict[str, str]] = []
+    seen = set()
+
+    for c in contexts:
+        raw = (c.get("source") or "").strip()
+        if not raw:
+            continue
+
+        # source bazen path'li gelirse sadece dosya adını al
+        name = os.path.basename(raw)
+
+        if name in seen:
+            continue
+        seen.add(name)
+
+        # Dosya gerçekten DOCS_DIR altında var mı?
+        file_path = (DOCS_DIR / name)
+        if file_path.exists() and DOCS_DIR.exists():
+            url = f"{DOCS_URL_PREFIX}/{name}"
+        else:
+            # Bulunamazsa URL boş kalsın (UI link yapmayabilir)
+            url = ""
+
+        sources.append({"name": name, "url": url})
+
+    return sources
+
 # -----------------------
 # ENDPOINTS
 # -----------------------
@@ -195,15 +245,23 @@ def health():
 def chat(req: ChatRequest):
     q = (req.message or "").strip()
     if not q:
-        return ChatResponse(answer="Bir soru yazar mısın?")
+        return ChatResponse(answer="Bir soru yazar mısın?", sources=[])
 
     # Selamlaşma: Milvus/OpenAI çağırmadan sabit cevap
     if GREETING_RE.match(q):
-        return ChatResponse(answer="Merhaba 👋 Selçuk Üniversitesi ile ilgili bir sorunuz varsa yardımcı olabilirim.")
+        return ChatResponse(
+            answer="Merhaba 👋 Selçuk Üniversitesi ile ilgili bir sorunuz varsa yardımcı olabilirim.",
+            sources=[],
+        )
 
     contexts = search_milvus(q, top_k=TOP_K)
     if not contexts:
-        return ChatResponse(answer="Bu konuda yönetmeliklerde net bir bilgi bulamadım. Soruyu biraz daha detaylandırır mısın?")
+        return ChatResponse(
+            answer="Bu konuda yönetmeliklerde net bir bilgi bulamadım. Soruyu biraz daha detaylandırır mısın?",
+            sources=[],
+        )
 
     answer = ask_llm(q, contexts, req.history)
-    return ChatResponse(answer=answer)
+    sources = extract_sources(contexts)
+
+    return ChatResponse(answer=answer, sources=sources)

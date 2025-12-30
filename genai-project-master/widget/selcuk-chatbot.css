@@ -85,6 +85,34 @@
   overflow:auto;
   background: #fafafa;
 }
+#selcuk-chatbot-panel .bubble .sources-box{
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 10px;
+  background: rgba(0,0,0,0.03);
+  font-size: 12px;
+  opacity: 0.95;
+}
+
+#selcuk-chatbot-panel .bubble .sources-title{
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+#selcuk-chatbot-panel .bubble .source-link{
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+#selcuk-chatbot-panel .bubble .source-sep{
+  opacity: 0.7;
+}
+
+#selcuk-chatbot-panel .bubble .source-text{
+  opacity: 0.85;
+}
+
 
 .msg{
   display:flex;
@@ -136,4 +164,17 @@
   padding: 0 12px 12px 12px;
   font-size: 11px;
   color: var(--selcuk-muted);
+}
+/* ✅ Kaynaklarda uzun dosya adları taşmasın (wrap) */
+#selcuk-chatbot-panel .bubble .sources-box{
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+#selcuk-chatbot-panel .bubble .sources-list,
+#selcuk-chatbot-panel .bubble .source-link,
+#selcuk-chatbot-panel .bubble .source-text{
+  white-space: normal;        /* tek satır zorlamasın */
+  overflow-wrap: anywhere;    /* uzun kelimeleri de kır */
+  word-break: break-word;     /* eski tarayıcı fallback */
 }
