@@ -29,6 +29,9 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 TOP_K = int(os.getenv("TOP_K", "3"))
 
+# ✅ Alaka eşiği: düşükse "alakasız" say ve kaynak döndürme
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.25"))  # 0.20 - 0.35 arası deneyebilirsin
+
 # PDF/DOC servis ayarları
 DOCS_DIR = Path(os.getenv("DOCS_DIR", "documents")).resolve()
 DOCS_URL_PREFIX = os.getenv("DOCS_URL_PREFIX", "/docs")  # URL path prefix
@@ -43,8 +46,6 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # -----------------------
 app = FastAPI(title="Selcuk Chatbot API")
 
-# Geliştirme için geniş CORS.
-# Yayında allow_origins'i spesifik domain(ler) ile sınırla.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # PROD: ["https://www.selcuk.edu.tr"]
@@ -82,7 +83,6 @@ def init_milvus():
             field_name=VECTOR_FIELD,
             index_params={"metric_type": "IP", "index_type": "AUTOINDEX", "params": {}},
         )
-        # index oluşana kadar bekle
         while True:
             progress = utility.index_building_progress(COLLECTION_NAME)
             if progress.get("indexed_rows", 0) == progress.get("total_rows", 1):
@@ -144,7 +144,7 @@ def search_milvus(query_text: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
                 "context": hit.entity.get("context"),
                 "source": hit.entity.get("source") if HAS_SOURCE else None,
                 "header": hit.entity.get("header") if HAS_HEADER else None,
-                "score": float(hit.distance),
+                "score": float(hit.distance),  # IP: büyük daha iyi
             }
         )
     return hits
@@ -163,7 +163,6 @@ def build_context_text(contexts: List[Dict[str, Any]]) -> str:
 def ask_llm(question: str, contexts: List[Dict[str, Any]], history: List[Dict[str, str]]) -> str:
     context_text = build_context_text(contexts)
 
-    # Kaynakları cevap içine yazdırmak yerine API'de ayrı alan olarak döndürüyoruz.
     prompt = f"""
 Aşağıdaki yönetmelik parçalarını kullanarak soruyu cevapla.
 
@@ -184,7 +183,6 @@ YANIT:
 
     messages = [{"role": "system", "content": "Sen Selçuk Üniversitesi öğrenci işlerinde uzman bir asistansın."}]
 
-    # Son birkaç mesajı ekleyelim (çok uzamasın)
     for m in history[-6:]:
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": m["content"]})
@@ -198,15 +196,10 @@ YANIT:
     )
     answer = completion.choices[0].message.content.strip()
 
-    # Ek güvenlik: model yine kaynak yazarsa temizle
     answer = re.sub(r"\[[^\]]+\.pdf\]", "", answer, flags=re.I).strip()
     return answer
 
 def extract_sources(contexts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Milvus hit'lerinden source alanlarını toplayıp tekrarsız şekilde
-    name+url olarak döndürür.
-    """
     sources: List[Dict[str, str]] = []
     seen = set()
 
@@ -215,19 +208,15 @@ def extract_sources(contexts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         if not raw:
             continue
 
-        # source bazen path'li gelirse sadece dosya adını al
         name = os.path.basename(raw)
-
         if name in seen:
             continue
         seen.add(name)
 
-        # Dosya gerçekten DOCS_DIR altında var mı?
         file_path = (DOCS_DIR / name)
         if file_path.exists() and DOCS_DIR.exists():
             url = f"{DOCS_URL_PREFIX}/{name}"
         else:
-            # Bulunamazsa URL boş kalsın (UI link yapmayabilir)
             url = ""
 
         sources.append({"name": name, "url": url})
@@ -258,6 +247,14 @@ def chat(req: ChatRequest):
     if not contexts:
         return ChatResponse(
             answer="Bu konuda yönetmeliklerde net bir bilgi bulamadım. Soruyu biraz daha detaylandırır mısın?",
+            sources=[],
+        )
+
+    # ✅ Alakasız soru filtresi: skor düşükse kaynak da dönme, LLM'e de gitme
+    best_score = float(contexts[0].get("score", 0.0))
+    if best_score < MIN_SCORE:
+        return ChatResponse(
+            answer="Üzgünüm yalnızca Selçuk Üniversitesi ile ilgili sorulara cevap verebilirim.",
             sources=[],
         )
 
